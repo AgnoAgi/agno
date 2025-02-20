@@ -6,7 +6,7 @@ try:
     import lancedb
     import pyarrow as pa
 except ImportError:
-    raise ImportError("`lancedb` not installed.")
+    raise ImportError("`lancedb` not installed. Use `pip install lancedb` to install it.")
 
 from agno.document import Document
 from agno.embedder import Embedder
@@ -36,6 +36,12 @@ class LanceDb(VectorDb):
         on_bad_vectors: What to do if the vector is bad. One of "error", "drop", "fill", "null".
         fill_value: The value to fill the vector with if on_bad_vectors is "fill".
     """
+
+    async_table: Optional[lancedb.db.AsyncTable] = None
+    table: Optional[lancedb.db.LanceTable] = None
+
+    connection: Optional[lancedb.LanceDBConnection] = None
+    async_connection: Optional[lancedb.AsyncConnection] = None
 
     def __init__(
         self,
@@ -83,25 +89,24 @@ class LanceDb(VectorDb):
             self._vector_col = self.table.schema.names[0]
             self._id = self.table.schema.names[1]  # type: ignore
 
-        if self.table is None:
-            # LanceDB table details
-            if table:
-                if not isinstance(table, lancedb.db.LanceTable):
-                    raise ValueError(
-                        "table should be an instance of lancedb.db.LanceTable, ",
-                        f"got {type(table)}",
-                    )
-                self.table = table
-                self.table_name = self.table.name
-                self._vector_col = self.table.schema.names[0]
-                self._id = self.tbl.schema.names[1]  # type: ignore
-            else:
-                if not table_name:
-                    raise ValueError("Either table or table_name should be provided.")
-                self.table_name = table_name
-                self._id = "id"
-                self._vector_col = "vector"
-                self.table = self._init_table()
+        # LanceDB table details
+        if table is not None:
+            if not isinstance(table, lancedb.db.LanceTable):
+                raise ValueError(
+                    "table should be an instance of lancedb.db.LanceTable, ",
+                    f"got {type(table)}",
+                )
+            self.table = table
+            self.table_name = self.table.name
+            self._vector_col = self.table.schema.names[0]
+            self._id = self.tbl.schema.names[1]  # type: ignore
+        else:
+            if not table_name:
+                raise ValueError("Either table or table_name should be provided.")
+            self.table_name = table_name
+            self._id = "id"
+            self._vector_col = "vector"
+            self.table = self._init_table()
 
         self.reranker: Optional[Reranker] = reranker
         self.nprobes: Optional[int] = nprobes
@@ -120,13 +125,30 @@ class LanceDb(VectorDb):
 
         logger.debug(f"Initialized LanceDb with table: '{self.table_name}'")
 
+    async def _get_async_connection(self) -> lancedb.AsyncConnection:
+        """Get or create an async connection to LanceDB."""
+        if self.async_connection is None:
+            self.async_connection = await lancedb.connect_async(self.uri)
+        if self.async_table is None:
+            self.async_table = await self.async_connection.open_table(self.table_name)
+        return self.async_connection
+
     def create(self) -> None:
         """Create the table if it does not exist."""
         if not self.exists():
-            self.connection = self._init_table()  # Connection update is needed
+            self.table = self._init_table()  # Connection update is needed
 
-    def _init_table(self) -> lancedb.db.LanceTable:
-        schema = pa.schema(
+    async def async_create(self) -> None:
+        """Create the table asynchronously if it does not exist."""
+        if not self.exists():
+            conn = await self._get_async_connection()
+            schema = self._base_schema()
+
+            logger.debug(f"Creating table asynchronously: {self.table_name}")
+            self.async_table = await conn.create_table(self.table_name, schema=schema, mode="overwrite", exist_ok=True)
+
+    def _base_schema(self) -> pa.Schema:
+        return pa.schema(
             [
                 pa.field(
                     self._vector_col,
@@ -140,8 +162,11 @@ class LanceDb(VectorDb):
             ]
         )
 
+    def _init_table(self) -> lancedb.db.LanceTable:
+        schema = self._base_schema()
+
         logger.debug(f"Creating table: {self.table_name}")
-        tbl = self.connection.create_table(self.table_name, schema=schema, mode="overwrite", exist_ok=True)
+        tbl = self.connection.create_table(self.table_name, schema=schema, mode="overwrite", exist_ok=True)  # type: ignore
         return tbl  # type: ignore
 
     def doc_exists(self, document: Document) -> bool:
@@ -159,6 +184,31 @@ class LanceDb(VectorDb):
                 return len(result) > 0
         except Exception:
             # Search sometimes fails with stale cache data, it means the doc doesn't exist
+            return False
+
+        return False
+
+    async def async_doc_exists(self, document: Document) -> bool:
+        """
+        Asynchronously validate if the document exists
+
+        Args:
+            document (Document): Document to validate
+
+        Returns:
+            bool: True if document exists, False otherwise
+        """
+        try:
+            await self._get_async_connection()
+            if self.table is not None:
+                cleaned_content = document.content.replace("\x00", "\ufffd")
+                doc_id = md5(cleaned_content.encode()).hexdigest()
+
+                result = await self.async_table.search().where(f"{self._id}='{doc_id}'").to_arrow()  # type: ignore
+                return len(result) > 0
+
+        except Exception as e:
+            logger.debug(f"Error checking document existence: {e}")
             return False
 
         return False
@@ -211,6 +261,57 @@ class LanceDb(VectorDb):
 
         logger.debug(f"Inserted {len(data)} documents")
 
+    async def async_insert(self, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Asynchronously insert documents into the database.
+
+        Args:
+            documents (List[Document]): List of documents to insert
+            filters (Optional[Dict[str, Any]]): Filters to apply while inserting documents
+        """
+        logger.debug(f"Inserting {len(documents)} documents")
+        data = []
+        if len(documents) <= 0:
+            logger.debug("No documents to insert")
+            return
+
+        # Prepare documents for insertion
+        for document in documents:
+            document.embed(embedder=self.embedder)
+            cleaned_content = document.content.replace("\x00", "\ufffd")
+            doc_id = str(md5(cleaned_content.encode()).hexdigest())
+            payload = {
+                "name": document.name,
+                "meta_data": document.meta_data,
+                "content": cleaned_content,
+                "usage": document.usage,
+            }
+            data.append(
+                {
+                    "id": doc_id,
+                    "vector": document.embedding,
+                    "payload": json.dumps(payload),
+                }
+            )
+            logger.debug(f"Parsed document: {document.name} ({document.meta_data})")
+
+        if not data:
+            logger.debug("No new data to insert")
+            return
+
+        try:
+            await self._get_async_connection()
+
+            if self.on_bad_vectors is not None:
+                await self.async_table.add(data, on_bad_vectors=self.on_bad_vectors, fill_value=self.fill_value)  # type: ignore
+            else:
+                await self.async_table.add(data)  # type: ignore
+
+            logger.debug(f"Asynchronously inserted {len(data)} documents")
+        except Exception as e:
+            logger.error(f"Error during async document insertion: {e}")
+            raise
+
     def upsert(self, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
         """
         Upsert documents into the database.
@@ -221,7 +322,35 @@ class LanceDb(VectorDb):
         """
         self.insert(documents)
 
+    async def async_upsert(self, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
+        await self.async_insert(documents, filters)
+
     def search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+        if self.search_type == SearchType.vector:
+            return self.vector_search(query, limit)
+        elif self.search_type == SearchType.keyword:
+            return self.keyword_search(query, limit)
+        elif self.search_type == SearchType.hybrid:
+            return self.hybrid_search(query, limit)
+        else:
+            logger.error(f"Invalid search type '{self.search_type}'.")
+            return []
+
+    async def async_search(
+        self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None
+    ) -> List[Document]:
+        """
+        Asynchronously search for documents matching the query.
+
+        Args:
+            query (str): Query string to search for
+            limit (int): Maximum number of results to return
+            filters (Optional[Dict[str, Any]]): Filters to apply to the search
+
+        Returns:
+            List[Document]: List of matching documents
+        """
+        # TODO: Search is not yet supported in async (https://github.com/lancedb/lancedb/pull/2049)
         if self.search_type == SearchType.vector:
             return self.vector_search(query, limit)
         elif self.search_type == SearchType.keyword:
@@ -338,13 +467,26 @@ class LanceDb(VectorDb):
     def drop(self) -> None:
         if self.exists():
             logger.debug(f"Deleting collection: {self.table_name}")
-            self.connection.drop_table(self.table_name)
+            self.connection.drop_table(self.table_name)  # type: ignore
+
+    async def async_drop(self) -> None:
+        """Drop the table asynchronously."""
+        if await self.async_exists():
+            logger.debug(f"Deleting collection: {self.table_name}")
+            conn = await self._get_async_connection()
+            await conn.drop_table(self.table_name)
 
     def exists(self) -> bool:
         if self.connection:
             if self.table_name in self.connection.table_names():
                 return True
         return False
+
+    async def async_exists(self) -> bool:
+        """Check if the table exists asynchronously."""
+        conn = await self._get_async_connection()
+        table_names = await conn.table_names()
+        return self.table_name in table_names
 
     def get_count(self) -> int:
         if self.exists() and self.table:
