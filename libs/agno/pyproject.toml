@@ -70,6 +70,7 @@ pgvector = ["pgvector"]
 chromadb = ["chromadb"]
 lancedb = ["lancedb", "tantivy"]
 qdrant = ["qdrant-client"]
+couchbase = ["couchbase"]
 
 # Dependencies for Knowledge
 pdf = ["pypdf"]
@@ -122,6 +123,7 @@ vectordbs = [
   "agno[chromadb]",
   "agno[lancedb]",
   "agno[qdrant]",
+  "agno[couchbase]",
 ]
 
 # All knowledge
@@ -273,5 +275,6 @@ module = [
   "wikipedia.*",
   "yfinance.*",
   "youtube_transcript_api.*",
+  "couchbase.*",
 ]
 ignore_missing_imports = true
